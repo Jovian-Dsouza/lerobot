@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from lerobot.utils.import_utils import _hidapi_available, _pygame_available, require_package
@@ -31,6 +32,64 @@ if TYPE_CHECKING or _hidapi_available:
     import hid
 else:
     hid = None  # type: ignore[assignment]
+
+
+@dataclass(frozen=True)
+class GamepadLayout:
+    """Raw pygame indices for the shoulder buttons and gripper controls."""
+
+    lb_button: int
+    rb_button: int
+    # Analog trigger axes (rest at -1, +1 fully pressed). None when triggers are buttons.
+    lt_axis: int | None
+    rt_axis: int | None
+    # Digital trigger buttons used by pads that report triggers as buttons.
+    close_button: int | None
+    open_button: int | None
+    # D-pad left/right buttons. None when the d-pad is reported as hat 0.
+    dpad_left_button: int | None
+    dpad_right_button: int | None
+
+
+# SDL GameController ordering, used by pygame 2 for Xbox/PlayStation pads:
+# A,B,X,Y,Back,Guide,Start,LS,RS,LB(9),RB(10),DPad(11-14); triggers on axes 4/5.
+SDL_STANDARD_LAYOUT = GamepadLayout(
+    lb_button=9,
+    rb_button=10,
+    lt_axis=4,
+    rt_axis=5,
+    close_button=None,
+    open_button=None,
+    dpad_left_button=13,
+    dpad_right_button=14,
+)
+# DirectInput-style pads (e.g. Logitech): LB/RB on 4/5, triggers as buttons 6/7, d-pad on hat 0.
+LEGACY_LAYOUT = GamepadLayout(
+    lb_button=4,
+    rb_button=5,
+    lt_axis=None,
+    rt_axis=None,
+    close_button=6,
+    open_button=7,
+    dpad_left_button=None,
+    dpad_right_button=None,
+)
+
+SDL_STANDARD_MIN_BUTTONS = 15
+SDL_STANDARD_MIN_AXES = 6
+TRIGGER_PRESSED_THRESHOLD = 0.5
+
+
+def resolve_layout(num_buttons: int, num_axes: int) -> GamepadLayout:
+    """Pick the button/axis layout from what the controller reports."""
+    if num_buttons >= SDL_STANDARD_MIN_BUTTONS and num_axes >= SDL_STANDARD_MIN_AXES:
+        return SDL_STANDARD_LAYOUT
+    return LEGACY_LAYOUT
+
+
+def trigger_gripper_command(lt: float, rt: float) -> tuple[bool, bool]:
+    """Return (close, open) from analog trigger values: LT closes, RT opens."""
+    return lt > TRIGGER_PRESSED_THRESHOLD, rt > TRIGGER_PRESSED_THRESHOLD
 
 
 class InputController:
@@ -65,6 +124,13 @@ class InputController:
     def get_deltas(self):
         """Get the current movement deltas (dx, dy, dz) in meters."""
         return 0.0, 0.0, 0.0
+
+    def get_axis_state(self) -> dict[str, float]:
+        """Normalized sticks and bumpers for joint teleop.
+
+        Keys are ``lx``, ``ly``, ``rx``, ``ry``, ``dpad_x`` in [-1, 1] and ``lb``, ``rb`` in [0, 1].
+        """
+        return {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0, "dpad_x": 0.0, "lb": 0.0, "rb": 0.0}
 
     def update(self):
         """Update controller state - call this once per frame."""
@@ -226,9 +292,10 @@ class GamepadController(InputController):
         super().__init__(x_step_size, y_step_size, z_step_size)
         self.deadzone = deadzone
         self.joystick = None
+        self.layout = LEGACY_LAYOUT
         self.intervention_flag = False
 
-    def start(self):
+    def start(self, announce: bool = True):
         """Initialize pygame and the gamepad."""
         pygame.init()
         pygame.joystick.init()
@@ -240,7 +307,11 @@ class GamepadController(InputController):
 
         self.joystick = pygame.joystick.Joystick(0)
         self.joystick.init()
-        logging.info(f"Initialized gamepad: {self.joystick.get_name()}")
+        self.layout = resolve_layout(self.joystick.get_numbuttons(), self.joystick.get_numaxes())
+        logging.info(f"Initialized gamepad: {self.joystick.get_name()} ({self.layout})")
+
+        if not announce:
+            return
 
         print("Gamepad controls:")
         print("  Left analog stick: Move in X-Y plane")
@@ -271,12 +342,11 @@ class GamepadController(InputController):
                 elif event.button == 0:
                     self.episode_end_status = TeleopEvents.RERECORD_EPISODE
 
-                # RB button (6) for closing gripper
-                elif event.button == 6:
+                # Digital trigger buttons (legacy pads): close / open gripper
+                elif event.button == self.layout.close_button:
                     self.close_gripper_command = True
 
-                # LT button (7) for opening gripper
-                elif event.button == 7:
+                elif event.button == self.layout.open_button:
                     self.open_gripper_command = True
 
             # Reset episode status on button release
@@ -284,17 +354,23 @@ class GamepadController(InputController):
                 if event.button in [0, 2, 3]:
                     self.episode_end_status = None
 
-                elif event.button == 6:
+                elif event.button == self.layout.close_button:
                     self.close_gripper_command = False
 
-                elif event.button == 7:
+                elif event.button == self.layout.open_button:
                     self.open_gripper_command = False
 
-            # Check for RB button (typically button 5) for intervention flag
-            if self.joystick.get_button(5):
-                self.intervention_flag = True
-            else:
-                self.intervention_flag = False
+            # RB held flags a human intervention
+            self.intervention_flag = bool(self.joystick.get_button(self.layout.rb_button))
+
+        # Analog triggers (SDL standard pads): LT closes, RT opens
+        if self.joystick is not None and self.layout.lt_axis is not None:
+            try:
+                self.close_gripper_command, self.open_gripper_command = trigger_gripper_command(
+                    self.joystick.get_axis(self.layout.lt_axis), self.joystick.get_axis(self.layout.rt_axis)
+                )
+            except pygame.error:
+                logging.error("Error reading gamepad triggers. Is it still connected?")
 
     def get_deltas(self):
         """Get the current movement deltas from gamepad state."""
@@ -322,6 +398,46 @@ class GamepadController(InputController):
         except pygame.error:
             logging.error("Error reading gamepad. Is it still connected?")
             return 0.0, 0.0, 0.0
+
+    def get_axis_state(self) -> dict[str, float]:
+        """Sticks on axes 0/1 (left) and 2/3 (right); d-pad and LB/RB indices come from the layout."""
+        zeros = {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0, "dpad_x": 0.0, "lb": 0.0, "rb": 0.0}
+        if self.joystick is None:
+            return zeros
+
+        def axis(index: int) -> float:
+            if index >= self.joystick.get_numaxes():
+                return 0.0
+            value = float(self.joystick.get_axis(index))
+            if abs(value) < self.deadzone:
+                return 0.0
+            return max(-1.0, min(1.0, value))
+
+        def button(index: int) -> float:
+            if index >= self.joystick.get_numbuttons():
+                return 0.0
+            return 1.0 if self.joystick.get_button(index) else 0.0
+
+        def dpad_x() -> float:
+            if self.layout.dpad_left_button is not None:
+                return button(self.layout.dpad_right_button) - button(self.layout.dpad_left_button)
+            if self.joystick.get_numhats() == 0:
+                return 0.0
+            return float(self.joystick.get_hat(0)[0])
+
+        try:
+            return {
+                "lx": axis(0),
+                "ly": axis(1),
+                "rx": axis(2),
+                "ry": axis(3),
+                "dpad_x": dpad_x(),
+                "lb": button(self.layout.lb_button),
+                "rb": button(self.layout.rb_button),
+            }
+        except pygame.error:
+            logging.error("Error reading gamepad. Is it still connected?")
+            return zeros
 
 
 class GamepadControllerHID(InputController):
@@ -353,6 +469,8 @@ class GamepadControllerHID(InputController):
         self.left_y = 0.0
         self.right_x = 0.0
         self.right_y = 0.0
+        self.lb = False
+        self.rb = False
 
         # Button states
         self.buttons = {}
@@ -370,7 +488,7 @@ class GamepadControllerHID(InputController):
         )
         return None
 
-    def start(self):
+    def start(self, announce: bool = True):
         """Connect to the gamepad using HIDAPI."""
         self.device_info = self.find_device()
         if not self.device_info:
@@ -387,12 +505,13 @@ class GamepadControllerHID(InputController):
             product = self.device.get_product_string()
             logging.info(f"Connected to {manufacturer} {product}")
 
-            logging.info("Gamepad controls (HID mode):")
-            logging.info("  Left analog stick: Move in X-Y plane")
-            logging.info("  Right analog stick: Move in Z axis (vertical)")
-            logging.info("  Button 1/B/Circle: Exit")
-            logging.info("  Button 2/A/Cross: End episode with SUCCESS")
-            logging.info("  Button 3/X/Square: End episode with FAILURE")
+            if announce:
+                logging.info("Gamepad controls (HID mode):")
+                logging.info("  Left analog stick: Move in X-Y plane")
+                logging.info("  Right analog stick: Move in Z axis (vertical)")
+                logging.info("  Button 1/B/Circle: Exit")
+                logging.info("  Button 2/A/Cross: End episode with SUCCESS")
+                logging.info("  Button 3/X/Square: End episode with FAILURE")
 
         except OSError as e:
             logging.error(f"Error opening gamepad: {e}")
@@ -439,14 +558,16 @@ class GamepadControllerHID(InputController):
                 # Parse button states (byte 5 in the Logitech RumblePad 2)
                 buttons = data[5]
 
+                # data[6] bit 0 is LB and bit 1 is RB on the Logitech report this parser expects.
+                raw_shoulders = data[6] if len(data) > 6 else 0
+                self.lb = bool(raw_shoulders & 1)
+                self.rb = bool(raw_shoulders & 2)
                 # Check if RB is pressed then the intervention flag should be set
-                self.intervention_flag = data[6] in [2, 6, 10, 14]
+                self.intervention_flag = self.rb
 
-                # Check if RT is pressed
-                self.open_gripper_command = data[6] in [8, 10, 12]
-
-                # Check if LT is pressed
-                self.close_gripper_command = data[6] in [4, 6, 12]
+                # Check if RT (bit 3) / LT (bit 2) is pressed. Other shoulder bits may be set too.
+                self.open_gripper_command = bool(data[6] & 8)
+                self.close_gripper_command = bool(data[6] & 4)
 
                 # Check if Y/Triangle button (bit 7) is pressed for saving
                 # Check if X/Square button (bit 5) is pressed for failure
@@ -471,3 +592,17 @@ class GamepadControllerHID(InputController):
         delta_z = -self.right_y * self.z_step_size  # Up/down
 
         return delta_x, delta_y, delta_z
+
+    def get_axis_state(self) -> dict[str, float]:
+        def clip(value: float) -> float:
+            return max(-1.0, min(1.0, float(value)))
+
+        return {
+            "lx": clip(self.left_x),
+            "ly": clip(self.left_y),
+            "rx": clip(self.right_x),
+            "ry": clip(self.right_y),
+            "dpad_x": (1.0 if self.rb else 0.0) - (1.0 if self.lb else 0.0),
+            "lb": 1.0 if self.lb else 0.0,
+            "rb": 1.0 if self.rb else 0.0,
+        }

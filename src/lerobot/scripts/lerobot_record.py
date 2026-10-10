@@ -139,6 +139,7 @@ from lerobot.teleoperators import (  # noqa: F401
     bi_openarm_mini,
     bi_rebot_102_leader,
     bi_so_leader,
+    gamepad,
     homunculus,
     koch_leader,
     make_teleoperator_from_config,
@@ -317,6 +318,8 @@ def record_loop(
         with timer.section("teleop"):
             # Get action from teleop
             if isinstance(teleop, Teleoperator):
+                if getattr(getattr(teleop, "config", None), "joint_control", False):
+                    teleop.seed_from_observation(obs)
                 act = teleop.get_action()
                 if robot.name == "unitree_g1":
                     teleop.send_feedback(obs)
@@ -382,6 +385,20 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
+def _rest_if_enabled(robot: Robot, teleop, cfg: RecordConfig) -> None:
+    """Gamepad joint mode on SO-10x: fold the arm into its rest pose and reseed the sticks."""
+    teleop_cfg = getattr(teleop, "config", None)
+    if not (getattr(teleop_cfg, "joint_control", False) and getattr(teleop_cfg, "rest_on_reset", False)):
+        return
+    if not getattr(cfg.robot, "use_degrees", False):
+        logging.warning("Skipping rest pose: it is defined in degrees but --robot.use_degrees=false.")
+        return
+    from lerobot.teleoperators.gamepad.rest_pose import move_to_rest
+
+    move_to_rest(robot, teleop_cfg.rest_speed, cfg.dataset.fps)
+    teleop.reset_joint_targets()
+
+
 @parser.wrap()
 def record(
     cfg: RecordConfig,
@@ -390,6 +407,19 @@ def record(
     robot_observation_processor: RobotProcessorPipeline | None = None,
 ) -> LeRobotDataset:
     init_logging()
+    # The stock gamepad teleop emits cartesian deltas. SO-10x followers record
+    # joint positions, so drive those joints from the sticks instead.
+    if (
+        cfg.teleop is not None
+        and cfg.teleop.type == "gamepad"
+        and cfg.robot.type in ("so100_follower", "so101_follower")
+    ):
+        cfg.teleop.joint_control = True
+        logging.info(
+            "Gamepad is commanding SO-10x joints: left stick pan/lift, right stick "
+            "wrist_flex/elbow, d-pad left/right wrist_roll, triggers gripper. "
+            "Right arrow ends the episode, left arrow re-records, Esc stops."
+        )
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_visualization(
@@ -403,6 +433,14 @@ def record(
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+    if (
+        teleop is not None
+        and getattr(cfg.teleop, "joint_control", False)
+        and not getattr(cfg.robot, "use_degrees", True)
+    ):
+        from lerobot.teleoperators.gamepad.teleop_gamepad import JOINT_LIMITS_NORMALIZED
+
+        teleop.joint_limits = dict(JOINT_LIMITS_NORMALIZED)
 
     # Fall back to identity pipelines when the caller doesn't supply processors.
     if (
@@ -500,6 +538,7 @@ def record(
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 episode_index = dataset.num_episodes
+                _rest_if_enabled(robot, teleop, cfg)
                 log_say(f"Recording episode {episode_index}", cfg.play_sounds)
                 record_loop(
                     robot=robot,
@@ -524,6 +563,7 @@ def record(
                     (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
+                    _rest_if_enabled(robot, teleop, cfg)
 
                     record_loop(
                         robot=robot,
@@ -564,6 +604,13 @@ def record(
         timer.log_run_summary()
 
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        # Park the arm in its rest pose once recording ends (the last episode has no reset phase).
+        if robot.is_connected:
+            try:
+                _rest_if_enabled(robot, teleop, cfg)
+            except Exception:
+                logging.exception("Could not move the arm to its rest pose before disconnecting")
 
         if dataset:
             dataset.finalize()

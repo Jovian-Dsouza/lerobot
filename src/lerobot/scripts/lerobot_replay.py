@@ -96,6 +96,23 @@ class ReplayConfig:
     dataset: DatasetReplayConfig
     # Use vocal synthesis to read events.
     play_sounds: bool = True
+    # SO-10x only: ease the arm into the folded rest pose before and after the replay,
+    # matching how `lerobot-record` starts every gamepad episode.
+    rest_on_reset: bool = True
+    # Degrees per second for the largest joint during the rest move.
+    rest_speed: float = 60.0
+
+
+def _rest_if_enabled(robot, cfg: ReplayConfig, fps: int) -> None:
+    """Move an SO-10x follower to its rest pose when enabled and the robot works in degrees."""
+    if not cfg.rest_on_reset:
+        return
+    if not getattr(cfg.robot, "use_degrees", False):
+        logging.warning("Skipping rest pose: it is defined in degrees but --robot.use_degrees=false.")
+        return
+    from lerobot.teleoperators.gamepad.rest_pose import move_to_rest
+
+    move_to_rest(robot, cfg.rest_speed, fps)
 
 
 @parser.wrap()
@@ -118,6 +135,7 @@ def replay(cfg: ReplayConfig):
     timer = CycleTimer(dataset.fps, records_data=False)
 
     try:
+        _rest_if_enabled(robot, cfg, dataset.fps)
         log_say("Replaying episode", cfg.play_sounds, blocking=True)
         for idx in range(dataset.num_frames):
             timer.tick()
@@ -138,6 +156,10 @@ def replay(cfg: ReplayConfig):
             timer.wait()
     finally:
         timer.log_run_summary()
+        try:
+            _rest_if_enabled(robot, cfg, dataset.fps)
+        except Exception:
+            logging.exception("Could not move the arm to its rest pose after replay")
         robot.disconnect()
 
 

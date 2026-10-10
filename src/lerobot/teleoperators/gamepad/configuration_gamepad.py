@@ -25,3 +25,15 @@ class GamepadTeleopConfig(TeleoperatorConfig):
     use_gripper: bool = True
     # Use hidapi instead of pygame for controllers that pygame cannot detect reliably.
     hidapi_fallback: bool = False
+    # When True, sticks integrate into absolute joint targets (`*.pos`) for arms
+    # such as SO-10x. When False, `get_action()` keeps the cartesian deltas used by HIL.
+    joint_control: bool = False
+    # Degrees (or normalized units) per second at full stick deflection.
+    joint_speed: float = 45.0
+    # Gripper units per second while a trigger is held. Gripper range is 0–100.
+    gripper_speed: float = 40.0
+    # Joint mode only: ease the follower into the folded rest pose at the start of each
+    # reset phase and right before every episode (so episode 0 starts there too).
+    rest_on_reset: bool = True
+    # Degrees per second for the largest joint during the rest move.
+    rest_speed: float = 60.0
